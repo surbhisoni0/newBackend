@@ -1,4 +1,4 @@
-"""30s / 1min / 2min timer modes: countdown, period roll-over, one stable prediction per period, honest 2min (no source)."""
+"""30s / 1min timer modes: countdown, period roll-over, one stable prediction per period."""
 import os, random, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from datetime import datetime, timezone
@@ -21,8 +21,8 @@ class _Feed:                                             # what WinGoFeedSource 
 
 class TestTimerModes(unittest.TestCase):
     def test_three_options_exist(self):
-        self.assertEqual([MODES[k]["seconds"] for k in ("30s", "1min", "2min")], [30, 60, 120])
-        self.assertIsNone(MODES["2min"]["type_id"])                         # no results feed is known for 2 minutes
+        self.assertEqual([MODES[k]["seconds"] for k in ("30s", "1min")], [30, 60])
+        self.assertNotIn("2min", MODES)
 
     def _live(self, P, clock):
         rng = random.Random(P)
@@ -56,19 +56,6 @@ class TestTimerModes(unittest.TestCase):
             nxt = s.next_prediction()
             self.assertEqual((nxt["target_period"], nxt["status"]), (str(base + 122), "pending"))
             self.assertNotEqual(nxt["id"], first["id"])
-
-    def test_2min_has_a_labelled_assumed_timer_and_no_predictions(self):
-        cfg = Settings(assumed_schedule=False).clock_config(MODES["2min"]["seconds"], force_assumed=True)
-        self.assertTrue(cfg.assumed)
-        self.assertFalse(Settings(assumed_schedule=False).clock_config(60).assumed)       # other modes unchanged
-        clock = [NOW + 10]
-        s = PredictorService(InMemoryRepository(), PredictionEngine(), clock_cfg=cfg, now_fn=lambda: clock[0])
-        c = s.clock()["countdown"]
-        self.assertEqual((c["state"], c["period_seconds"], round(c["seconds_remaining"])), ("assumed", 120, 110))   # never 'open' / verified
-        clock[0] = NOW + 120 + 5
-        self.assertEqual(round(s.clock()["countdown"]["seconds_remaining"]), 115)       # resets for the next 2-minute period
-        p = s.next_prediction()
-        self.assertFalse(p["available"])                                                # no results -> no prediction is invented
 
 
 if __name__ == "__main__":
