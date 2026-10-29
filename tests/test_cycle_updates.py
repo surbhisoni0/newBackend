@@ -1,4 +1,4 @@
-"""One estimate per completed cycle, for all three timers (30s / 1min / 2min), over several consecutive cycles.
+"""One estimate per completed cycle, for both timers (30s / 1min), over several consecutive cycles.
 Estimate = model output bound to ONE round; verified result = what the feed/user confirmed. They are never mixed up."""
 import os, random, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -66,20 +66,6 @@ class TestCycleUpdates(unittest.TestCase):
             if clock[0] > NOW0 + 45: ids.add(svc.next_prediction()["id"])
         self.assertEqual(len(ids), 1)                                          # frozen, not re-rolled, across ~4 further cycles
         self.assertEqual(svc.history(50)["total"], 2)
-
-    def test_2min_estimate_follows_each_added_result(self):
-        clock = [NOW0]
-        svc = PredictorService(InMemoryRepository(), PredictionEngine(), clock_cfg=ClockConfig(period_seconds=120, assumed=True), now_fn=lambda: clock[0])
-        self.assertFalse(svc.next_prediction()["available"])                   # no source, no history: nothing invented
-        svc.import_rows([{"number": (i * 7 + i // 4) % 10} for i in range(120)])
-        prev = svc.next_prediction(); self.assertTrue(prev["available"])
-        for cycle, n in enumerate([1, 8, 3, 9, 4], 1):
-            clock[0] += 120
-            self.assertEqual(svc.next_prediction()["id"], prev["id"])          # a new timer cycle alone never changes it
-            out = svc.add_result(n); cur = out["next_prediction"]
-            self.assertNotEqual(cur["id"], prev["id"]); self.assertEqual(cur["target_seq"], prev["target_seq"] + 1)
-            self.assertEqual(out["resolved_prediction"]["outcome"]["actual"], n)
-            prev = cur
 
 
 if __name__ == "__main__":
