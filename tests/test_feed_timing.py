@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.database.memory_repo import InMemoryRepository
 from app.prediction.engine import PredictionEngine
 from app.services.predictor_service import PredictorService
+from app.config import Settings
 from app.sync.sources import WinGoFeedSource
 from app.timing import ClockConfig, advance_period_id, next_period_id
 
@@ -58,6 +59,19 @@ class TestFeedTiming(unittest.TestCase):
         self.assertEqual(c["next_round"]["period_id"], "20261029100010011")
         bad = WinGoFeedSource("https://example.invalid/x", 1, 60)._settled([{"state": 1, "number": 3, "issueNumber": "1", "endTime": "not a time"}])
         self.assertIsNone(bad[0].timestamp)                                          # never guessed
+
+
+    def test_rows_stored_before_the_fix_still_verify_in_feed_mode(self):
+        """Regression: rows already in the DB are naive IST text. With the feed on, they must be read as IST even if SOURCE_TIMEZONE=UTC;
+        with the feed off, SOURCE_TIMEZONE is still honoured."""
+        ist, end = timezone(timedelta(hours=5, minutes=30)), (int(time.time()) // 60) * 60
+        rows = [{"number": i % 10, "period_id": str(20261029100010001 + i),
+                 "timestamp": datetime.fromtimestamp(end - 60 * (29 - i), ist).strftime("%Y-%m-%dT%H:%M:%S")} for i in range(30)]
+        feed = Settings(feed_enabled=True, feed_url="https://example.invalid", source_timezone="UTC")
+        s = PredictorService(InMemoryRepository(), PredictionEngine(), clock_cfg=feed.clock_config(60)); s.import_rows(rows)
+        self.assertEqual(s.clock()["countdown"]["state"], "open")
+        off = Settings(feed_enabled=False, feed_url="", source_timezone="UTC")
+        self.assertEqual(off.clock_config(60).source_tz, "UTC")
 
 
 if __name__ == "__main__":
