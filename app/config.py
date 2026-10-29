@@ -60,7 +60,10 @@ class Settings:
 
     def clock_config(self, period_seconds=None):
         from app.timing import ClockConfig
-        return ClockConfig(period_seconds or self.period_seconds, self.source_timezone, self.timestamp_means, self.clock_tolerance_seconds,
+        # The live feed reports IST times without an offset (see WinGoFeedSource), so rows it stored earlier are IST text:
+        # read them as IST whatever SOURCE_TIMEZONE says, otherwise they look ~5.5 h in the future -> "Timing unverified".
+        tz = "Asia/Kolkata" if (self.feed_enabled and self.feed_url) else self.source_timezone
+        return ClockConfig(period_seconds or self.period_seconds, tz, self.timestamp_means, self.clock_tolerance_seconds,
                            self.clock_min_samples, self.late_grace_seconds, self.assumed_schedule, self.assumed_offset_seconds)
 
 
