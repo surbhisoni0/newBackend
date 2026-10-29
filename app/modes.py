@@ -4,6 +4,7 @@ from urllib.parse import urlsplit, urlunsplit
 MODES = {
     "30s": {"label": "WinGo 30s", "seconds": 30, "type_id": 30},
     "1min": {"label": "WinGo 1Min", "seconds": 60, "type_id": 1},
+    "2min": {"label": "WinGo 2Min", "seconds": 120, "type_id": None},     # no results feed is known for 2 min: timer only, never predictions
     "3min": {"label": "WinGo 3Min", "seconds": 180, "type_id": 10},
     "5min": {"label": "WinGo 5Min", "seconds": 300, "type_id": 3},
 }
