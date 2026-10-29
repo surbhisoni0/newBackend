@@ -58,13 +58,13 @@ class Settings:
     feed_url: str = os.getenv("FEED_URL", "")
     feed_backfill_rows: int = int(os.getenv("FEED_BACKFILL_ROWS", "1000"))
 
-    def clock_config(self, period_seconds=None):
+    def clock_config(self, period_seconds=None, force_assumed=False):
         from app.timing import ClockConfig
         # The live feed reports IST times without an offset (see WinGoFeedSource), so rows it stored earlier are IST text:
         # read them as IST whatever SOURCE_TIMEZONE says, otherwise they look ~5.5 h in the future -> "Timing unverified".
         tz = "Asia/Kolkata" if (self.feed_enabled and self.feed_url) else self.source_timezone
         return ClockConfig(period_seconds or self.period_seconds, tz, self.timestamp_means, self.clock_tolerance_seconds,
-                           self.clock_min_samples, self.late_grace_seconds, self.assumed_schedule, self.assumed_offset_seconds)
+                           self.clock_min_samples, self.late_grace_seconds, self.assumed_schedule or force_assumed, self.assumed_offset_seconds)
 
 
 def get_settings() -> Settings:
