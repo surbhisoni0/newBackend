@@ -146,6 +146,13 @@ class HttpJsonSource:
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+def _feed_ts(value) -> Optional[str]:
+    """The feed's times are IST with no offset. Store them as UTC ("...Z") so SOURCE_TIMEZONE can never misread them
+    (read as UTC they land 5.5 h in the future and the schedule is reported as unverified). Unparseable -> None, never guessed."""
+    from app.timing import iso, parse_ts
+    return iso(parse_ts(value, "Asia/Kolkata"))
+
+
 class WinGoFeedSource(HttpJsonSource):
     """WinGo results feed used by WingoRadar (POST, JSON). Verified fields: issueNumber, number, state (0 open / 1 settled),
     startTime / endTime (IST, no offset), intervalM. The request's `Time` is the IST trading day. Also remembers the OPEN round
@@ -184,7 +191,7 @@ class WinGoFeedSource(HttpJsonSource):
                 period = str(it["issueNumber"]).strip()
                 if not period.isdigit():
                     raise ValueError("period")
-                good.append(RoundRecord(period, _digit(it["number"]), str(it["endTime"])))
+                good.append(RoundRecord(period, _digit(it["number"]), _feed_ts(it["endTime"])))
             except (KeyError, TypeError, ValueError):
                 bad += 1
         self.last_invalid = bad
