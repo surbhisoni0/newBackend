@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
 def _build_mode(s, mode: str, m: dict):
     repo = create_repository(mode_db_url(s.database_url, mode)); repo.init()
     service = PredictorService(repo, PredictionEngine(refit_every=s.refit_every), s.min_history, s.min_validation_n,
-                               clock_cfg=s.clock_config(m["seconds"]))
+                               clock_cfg=s.clock_config(m["seconds"], force_assumed=not m["type_id"]))     # no source for this mode: labelled, assumed timer
     seed = _find_seed(s.seed_csv)
     if mode == DEFAULT_MODE and s.auto_seed and repo.last_result() is None:
         if seed:
@@ -65,7 +65,7 @@ def _build_mode(s, mode: str, m: dict):
     sync_headers = json.loads(s.sync_headers_json) if s.sync_headers_json else {}
     if s.sync_auth_header and "Authorization" not in sync_headers:     # securely-stored token -> Authorization header
         sync_headers["Authorization"] = s.sync_auth_header
-    if s.feed_enabled and s.feed_url:
+    if s.feed_enabled and s.feed_url and m["type_id"]:
         source = WinGoFeedSource(s.feed_url, m["type_id"], m["seconds"], backfill_rows=s.feed_backfill_rows,
                                  respect_robots=s.sync_respect_robots)
         service.live_source = source
