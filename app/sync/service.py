@@ -62,14 +62,16 @@ class SyncService:
                   "invalid_items": 0, "gap": None}
 
     def _fail(self, state: str, msg: str, count_failure: bool = True):
-        self.s.update(state=state, last_error=msg)
+        self.s.update(state=state, last_error=msg, stage="idle")
         if count_failure:
             self.s["consecutive_failures"] += 1
         log.warning("sync %s: %s", state, msg)
 
     def run_once(self) -> dict:
         with self._lock:
-            self.s["last_attempt"] = time.time()
+            t_run = time.time()
+            self.s["last_attempt"] = t_run
+            self.s["stage"] = "fetching"
             if not self.source.configured:
                 self.s.update(state="not_configured", last_error="No authorized data source is configured (see SYNC_* in backend/.env).")
                 return self.status()
@@ -80,6 +82,8 @@ class SyncService:
                 self._fail("error", str(e)[:300])
                 return self.status()
             repo = self.predictor.repo
+            t_fetched = time.time()
+            self.s.update(stage="storing", last_fetch_seconds=round(t_fetched - t_run, 1), last_fetch_records=len(records))
             with self.predictor.lock:
                 last = repo.last_result()
                 anchor = last["period_id"] if last else None
@@ -102,6 +106,9 @@ class SyncService:
                 except Exception as e:                                       # noqa: BLE001
                     self._fail("rejected", f"validation failed, nothing stored: {e}"[:300])
                     return self.status()
+            self.s.update(stage="idle", last_run_seconds=round(time.time() - t_run, 1), last_store_seconds=round(time.time() - t_fetched, 1))
+            log.info("sync ok: fetched %s records in %ss, stored %s in %ss, newest %s", len(records), self.s["last_fetch_seconds"], len(rows),
+                     self.s["last_store_seconds"], rows[-1]["period_id"] if rows else "-")
             self.s.update(last_success=time.time(), consecutive_failures=0, last_ingested=len(rows), gap=plan["gap"],
                           invalid_items=getattr(self.source, "last_invalid", 0), state="ok", last_error=None)
             self.s["ingested_total"] += len(rows)
