@@ -84,7 +84,9 @@ class SyncService:
             repo = self.predictor.repo
             t_fetched = time.time()
             self.s.update(stage="storing", last_fetch_seconds=round(t_fetched - t_run, 1), last_fetch_records=len(records))
+            t_lock = time.time()
             with self.predictor.lock:
+                self.s["last_lock_wait_seconds"] = round(time.time() - t_lock, 1)      # time spent waiting for page requests to let go
                 last = repo.last_result()
                 anchor = last["period_id"] if last else None
                 if last and not anchor:
