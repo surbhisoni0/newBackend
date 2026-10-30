@@ -96,7 +96,8 @@ class SyncService:
                                    "SYNC_START_AFTER_PERIOD to the round ID of your newest stored round.", count_failure=False)
                         self.s["last_success"] = time.time()
                         return self.status()
-                plan = plan_ingest(records, anchor, repo.has_period, self.allow_gaps)
+                have = repo.existing_periods([r.period_id for r in records])
+                plan = plan_ingest(records, anchor, lambda pid: pid in have, self.allow_gaps)
                 rows = [{"number": r.number, "period_id": r.period_id, "timestamp": r.timestamp} for r in plan["ingest"]]
                 try:
                     if len(rows) == 1:
