@@ -57,6 +57,7 @@ class Settings:
     feed_enabled: bool = os.getenv("FEED_ENABLED", "false").lower() == "true"     # WinGo results feed (user confirmed permission)
     feed_url: str = os.getenv("FEED_URL", "")
     feed_backfill_rows: int = int(os.getenv("FEED_BACKFILL_ROWS", "1000"))
+    feed_timeout: float = float(os.getenv("FEED_TIMEOUT", "25"))      # seconds per request; a slow upstream must not stall sync forever
 
     def clock_config(self, period_seconds=None, force_assumed=False):
         from app.timing import ClockConfig
