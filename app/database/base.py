@@ -21,6 +21,9 @@ class Repository(ABC):
     def last_result(self) -> Optional[dict]: ...
     @abstractmethod
     def has_period(self, period_id: str) -> bool: ...
+    def existing_periods(self, period_ids) -> set:
+        """Which of these round ids are already stored. Default: one has_period call each; real databases override with ONE query."""
+        return {p for p in period_ids if self.has_period(p)}
     # ---- predictions / outcomes ----
     @abstractmethod
     def save_prediction(self, pred: dict) -> int: ...
