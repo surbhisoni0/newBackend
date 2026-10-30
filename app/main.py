@@ -67,7 +67,7 @@ def _build_mode(s, mode: str, m: dict):
         sync_headers["Authorization"] = s.sync_auth_header
     if s.feed_enabled and s.feed_url and m["type_id"]:
         source = WinGoFeedSource(s.feed_url, m["type_id"], m["seconds"], backfill_rows=s.feed_backfill_rows,
-                                 respect_robots=s.sync_respect_robots)
+                                 respect_robots=s.sync_respect_robots, timeout=s.feed_timeout)
         service.live_source = source
         sync = SyncService(service, source, True, 10, stale_after=max(120, 4 * m["seconds"]), allow_gaps=True, fast_interval=3)
     elif mode == DEFAULT_MODE:
