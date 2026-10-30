@@ -63,7 +63,8 @@ class PredictorService:
     # ------------------------------------------------------------ data flow
     def _store(self, items: list) -> list:
         last = self.repo.last_result()
-        cleaned = clean_rows(items, last["period_id"] if last else None, self.repo.has_period)
+        have = self.repo.existing_periods([str(it["period_id"]).strip() for it in items if isinstance(it, dict) and it.get("period_id")])
+        cleaned = clean_rows(items, last["period_id"] if last else None, lambda pid: pid in have)
         return self.repo.add_results(cleaned)
 
     def _resolve(self, row: dict) -> Optional[dict]:
