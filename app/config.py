@@ -24,7 +24,7 @@ class Settings:
     allowed_origins: tuple = tuple(o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:8000").split(",") if o.strip())
     auto_seed: bool = os.getenv("AUTO_SEED", "true").lower() == "true"
     seed_csv: str = os.getenv("SEED_CSV", "data/wingo_transcribed.csv")
-    auto_backtest: bool = os.getenv("AUTO_BACKTEST", "true").lower() == "true"
+    auto_backtest: bool = os.getenv("AUTO_BACKTEST", "false").lower() == "true"     # the walk-forward test takes minutes of CPU: off unless asked for
     refit_every: int = int(os.getenv("MODEL_REFIT_EVERY", "10"))
     min_history: int = int(os.getenv("MIN_HISTORY", "100"))
     min_validation_n: int = int(os.getenv("MIN_VALIDATION_N", "300"))
