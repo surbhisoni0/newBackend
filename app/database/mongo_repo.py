@@ -89,6 +89,12 @@ class MongoRepository(Repository):
     def has_period(self, period_id):
         return self.db.results.count_documents({"period_id": period_id}, limit=1) > 0
 
+    def existing_periods(self, period_ids) -> set:
+        ids, found = [str(p) for p in period_ids if p], set()
+        for i in range(0, len(ids), 1000):                          # one round trip per 1000 ids instead of one per id
+            found.update(d["period_id"] for d in self.db.results.find({"period_id": {"$in": ids[i:i + 1000]}}, {"period_id": 1}))
+        return found
+
     # ------------------------------------------------------------ predictions
     _PRED_KEYS = ("target_seq", "target_period", "engine_version", "n_history", "top1", "top3", "size", "color",
                   "signal", "ranking", "model_tops", "model_scores")
