@@ -85,7 +85,9 @@ class SyncService:
                 anchor = last["period_id"] if last else None
                 if last and not anchor:
                     anchor = self.start_after or None
-                    if not anchor:
+                    if not anchor and self.allow_gaps:               # live feed: rounds carry their own ids and gaps are allowed, so an
+                        pass                                         # ids-less seed history cannot block it; dedupe is by period id
+                    elif not anchor:
                         self._fail("needs_anchor", "Stored history has no round IDs, so the sequence cannot be verified. Set "
                                    "SYNC_START_AFTER_PERIOD to the round ID of your newest stored round.", count_failure=False)
                         self.s["last_success"] = time.time()
