@@ -31,6 +31,10 @@ class Settings:
     # live sync: OFF unless you configure a data source you are allowed to use
     ui_poll_seconds: float = max(10.0, float(os.getenv("UI_POLL_SECONDS", "30")))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    # worker threads for sync (def) routes; main.py never goes below 40
+    threadpool_size: int = max(1, int(os.getenv("THREADPOOL_SIZE", "40") or "40"))
+    # comma-separated mode keys from app/modes.py (30s,1min,3min,5min) or "all"; the default mode (1min) is always added by main.py
+    enabled_modes: tuple = tuple(m.strip().lower() for m in (os.getenv("ENABLED_MODES", "all") or "all").split(",") if m.strip()) or ("all",)
     sync_stale_after: float = float(os.getenv("SYNC_STALE_AFTER_SECONDS", "300"))
     sync_enabled: bool = os.getenv("SYNC_ENABLED", "false").lower() == "true"
     sync_interval: float = float(os.getenv("SYNC_INTERVAL_SECONDS", "30"))
