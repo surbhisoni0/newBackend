@@ -99,11 +99,10 @@ class PredictorService:
     def prewarm(self) -> None:
         """Fit the models that are due NOW (at start-up, in a background thread) so the first request does not pay for the fit.
         Same engine, same data: it only moves the work earlier, so the values are unchanged."""
-        try:
-            with self.lock:
-                last = self.repo.last_result()
-                if last and last["seq"] >= self.min_history:
-                    self.engine.model_scores(self._numbers())
+        try:                                               # no service lock: the engine has its own fit lock, so sync and page reads are not blocked by the fit
+            last = self.repo.last_result()
+            if last and last["seq"] >= self.min_history:
+                self.engine.model_scores(self._numbers())
         except Exception:
             pass
 
