@@ -38,10 +38,39 @@ class PredictorService:
         self.backtest_state = {"status": "idle", "progress": 0, "total": 0, "error": None}
         self.live_source = None
         self._proj = None                                   # the one projection built for the current cycle (never stored)
+        self._nums_cache = None                             # (key of newest round, read-only numpy array)
+        self._memos = {}                                    # report name -> (data key, report)
 
     # ------------------------------------------------------------ helpers
     def _numbers(self) -> np.ndarray:
-        return np.array(self.repo.get_numbers(), dtype=int)
+        """All stored numbers, oldest first. The history only ever grows, so it is re-read from the database ONLY when the newest stored round
+        changed (one cheap indexed query decides that). Before, every page request, poll and prediction re-read all rows (several times per call).
+        Values are identical; the array is read-only so no caller can corrupt the shared copy."""
+        last = self.repo.last_result()
+        key = (last["seq"], last.get("period_id"), last["number"]) if last else None
+        c = self._nums_cache
+        if key is not None and c is not None and c[0] == key:
+            return c[1]
+        arr = np.array(self.repo.get_numbers(), dtype=int)
+        arr.setflags(write=False)
+        if key is not None:
+            self._nums_cache = (key, arr)
+        return arr
+
+    def _data_key(self) -> tuple:
+        """Everything the heavy read-only reports depend on: the newest round (live outcomes only change with a new round) and the latest backtest."""
+        last, bt = self.repo.last_result(), self.repo.latest_backtest()
+        return (last["seq"] if last else 0, last.get("period_id") if last else None, bt["id"] if bt else None)
+
+    def _memo(self, name: str, fn: Callable[[], dict]) -> dict:
+        """Compute a heavy report once per (new round / new backtest) instead of on every request. Same values: it is only a cache."""
+        key = self._data_key()
+        c = self._memos.get(name)
+        if c is not None and c[0] == key:
+            return dict(c[1])
+        v = fn()
+        self._memos[name] = (key, v)
+        return dict(v)
 
     def live_metrics(self) -> dict:
         outs = [o["outcome"] for o in self.repo.all_outcomes()]
@@ -291,6 +320,9 @@ class PredictorService:
                 "color_hit": o["color_hit"] if o else None, "result": result}
 
     def data_stats(self) -> dict:
+        return self._memo("data_stats", self._data_stats)
+
+    def _data_stats(self) -> dict:
         nums = self._numbers()
         out = analysis.analyze(nums, self.repo.get_meta())
         if out.get("counts"):
@@ -299,6 +331,9 @@ class PredictorService:
         return out
 
     def performance(self) -> dict:
+        return self._memo("performance", self._performance)
+
+    def _performance(self) -> dict:
         outs = self.repo.all_outcomes()
         live = self.live_metrics()
         keys = {"top1": "top1_hit", "top3": "top3_hit", "bs": "bs_hit", "color": "color_hit"}
@@ -314,6 +349,11 @@ class PredictorService:
                 "backtest": None if not bt else {"id": bt["id"], **bt["summary"]}}
 
     def stats_report(self) -> dict:
+        out = self._memo("stats_report", self._stats_report)
+        out["backtest_state"] = self.backtest_state          # live progress must never come from the cache
+        return out
+
+    def _stats_report(self) -> dict:
         nums = self._numbers()
         rows, _ = self.repo.list_results(len(nums) or 1, 0)
         return {"total_results": len(nums), "backtest_state": self.backtest_state, "disclaimer": DISCLAIMER,
