@@ -34,6 +34,7 @@ class PredictorService:
         self.clock_cfg, self.now_fn = clock_cfg or ClockConfig(), now_fn
         self.min_history, self.min_validation_n = min_history, min_validation_n
         self.lock = threading.RLock()
+        self.warm_wait_seconds = 8.0                        # a page request waits at most this long (outside the lock) for the first model fit
         self.backtest_state = {"status": "idle", "progress": 0, "total": 0, "error": None}
         self.live_source = None
         self._proj = None                                   # the one projection built for the current cycle (never stored)
@@ -89,12 +90,21 @@ class PredictorService:
         existing = self.repo.get_prediction_by_target(target)
         if existing and existing["status"] == "pending":
             return existing
+        if not self._models_ready():                       # first model fit after a restart still running: do not block on it, the pick is made once it is ready
+            return None
         p = self.engine.predict(self._numbers())
         lp = last["period_id"]
         pred = {**p, "target_seq": target, "target_period": next_period_id(lp),
                 "signal": self.current_signal(), "made_at": self.now_fn()}
         self.repo.save_prediction(pred)
         return self.repo.get_prediction_by_target(target)
+
+    def _models_ready(self) -> bool:
+        nums = self._numbers()
+        if self.engine.ready(len(nums)):
+            return True
+        self.engine.warm_async(nums)                       # idempotent: joins the fit that is already running
+        return False
 
     def prewarm(self) -> None:
         """Fit the models that are due NOW (at start-up, in a background thread) so the first request does not pay for the fit.
@@ -217,13 +227,25 @@ class PredictorService:
         self._proj = {"key": key, "pred": pred}
         return pred
 
+    def _await_models(self) -> None:
+        """Before taking the lock: give a first fit a bounded chance to finish, so a fast server answers normally right after a restart and a slow
+        one answers "warming up" instead of hanging."""
+        nums = self._numbers()
+        if not self.engine.ready(len(nums)):
+            self.engine.warm_async(nums)
+            self.engine.wait_ready(self.warm_wait_seconds)
+
     def next_prediction(self) -> dict:
+        self._await_models()
         now = self.now_fn()
         with self.lock:                                       # one consistent view: pick, newest result, clock and projection
             p = self._next_prediction()
             last = self.repo.last_result()
             timing = self.clock(now)
             if p is None:
+                if last and last["seq"] >= self.min_history:      # enough data: the models are simply still being fitted after a restart
+                    return {"available": False, "warming": True, "timing": timing, "disclaimer": DISCLAIMER,
+                            "reason": "The prediction models are warming up after a server restart. The estimate appears here automatically in a moment."}
                 return {"available": False, "reason": f"Need at least {self.min_history} results (have {last['seq'] if last else 0}).",
                         "timing": timing, "disclaimer": DISCLAIMER}
             state = timing["countdown"]["state"]
@@ -241,7 +263,7 @@ class PredictorService:
                 made = parse_ts(p.get("created_at")) or now
             missed = max(0, cur - self._cycle_index(min(made, now), phase, P))     # cycles finished since this pick was made
             settling = missed == 1 and into < SETTLE_SECONDS   # normal case: the ended round's result is a moment away
-            shown = self._projection(last, cur, missed, timing, now) if missed >= 1 and not settling else p
+            shown = self._projection(last, cur, missed, timing, now) if missed >= 1 and not settling and self._models_ready() else p
             kind = "projection" if shown is not p else "pick"
             wait = (SETTLE_SECONDS - into if settling else P - into + (SETTLE_SECONDS if missed == 0 else 0.0)) + 0.5
             return {"available": True, "latest_result": last, "estimate_state": "projection" if kind == "projection" else est,
