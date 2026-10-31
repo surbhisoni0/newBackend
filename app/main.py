@@ -59,6 +59,7 @@ def _build_mode(s, mode: str, m: dict):
             service.import_csv(seed.read_text(encoding="utf-8"))
         else:
             log.warning("AUTO_SEED is on but %s was not found; the database stays empty", s.seed_csv)
+    threading.Thread(target=service.prewarm, daemon=True).start()          # model fit happens now, not inside the first request
     last = repo.last_result()
     if s.auto_backtest and last and last["seq"] > s.min_history + 50 and repo.latest_backtest() is None:
         threading.Thread(target=service.run_backtest, daemon=True).start()
