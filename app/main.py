@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from app.api.routes import router
@@ -36,19 +37,31 @@ def _find_seed(name: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     s = get_settings()
+    try:                                                          # more worker threads for sync routes: slow ones must not queue everything else
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = max(40, s.threadpool_size)
+    except Exception:                                             # noqa: BLE001
+        log.warning("could not resize the worker thread pool", exc_info=True)
     app.state.settings, app.state.services, app.state.syncs, tasks = s, {}, {}, []
+    wanted = set(MODES) if "all" in s.enabled_modes else {m for m in s.enabled_modes if m in MODES}
+    wanted.add(DEFAULT_MODE)                                      # the API's default mode must always exist
+    log.info("starting modes: %s", [m for m in MODES if m in wanted])
     for mode, m in MODES.items():
-        service, sync = _build_mode(s, mode, m)
+        if mode not in wanted:
+            continue
+        service, sync = _build_mode(s, mode, m, prewarm=False)
         app.state.services[mode], app.state.syncs[mode] = service, sync
         if sync.enabled:
             tasks.append(asyncio.create_task(sync.run_forever()))     # no browser needed: runs on the server
     app.state.service, app.state.sync = app.state.services[DEFAULT_MODE], app.state.syncs[DEFAULT_MODE]
+    # model fits happen ONE AT A TIME in the background: parallel fits on a small host starve the web server of CPU and time requests out
+    threading.Thread(target=lambda: [sv.prewarm() for sv in list(app.state.services.values())], daemon=True, name="prewarm").start()
     yield
     for t in tasks:
         t.cancel()
 
 
-def _build_mode(s, mode: str, m: dict):
+def _build_mode(s, mode: str, m: dict, prewarm: bool = True):
     repo = create_repository(mode_db_url(s.database_url, mode)); repo.init()
     service = PredictorService(repo, PredictionEngine(refit_every=s.refit_every), s.min_history, s.min_validation_n,
                                clock_cfg=s.clock_config(m["seconds"], force_assumed=not m["type_id"]))     # no source for this mode: labelled, assumed timer
@@ -59,7 +72,8 @@ def _build_mode(s, mode: str, m: dict):
             service.import_csv(seed.read_text(encoding="utf-8"))
         else:
             log.warning("AUTO_SEED is on but %s was not found; the database stays empty", s.seed_csv)
-    threading.Thread(target=service.prewarm, daemon=True).start()          # model fit happens now, not inside the first request
+    if prewarm:
+        threading.Thread(target=service.prewarm, daemon=True).start()      # model fit happens now, not inside the first request
     last = repo.last_result()
     if s.auto_backtest and last and last["seq"] > s.min_history + 50 and repo.latest_backtest() is None:
         threading.Thread(target=service.run_backtest, daemon=True).start()
@@ -85,6 +99,9 @@ app = FastAPI(title="WinGo Analysis Platform", version=ENGINE_VERSION, lifespan=
               description="Research/analysis tool. Statistical candidates only - no guarantees, no betting functionality.")
 app.add_middleware(CORSMiddleware, allow_origins=list(get_settings().allowed_origins), allow_methods=["GET", "POST"],
                    allow_headers=["Content-Type", "X-API-Key"])
+
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)                       # smaller payloads through the Vercel proxy
 
 
 @app.middleware("http")
