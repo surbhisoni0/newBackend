@@ -4,6 +4,8 @@ Produces per-model scores, an UNWEIGHTED rank-average consensus, and Top-3 / Big
 Nothing here is a calibrated probability. Whether the output deserves any trust is decided by signal.py from
 walk-forward validation, never by the model itself.
 """
+import logging
+import threading
 import numpy as np
 from app.prediction import baselines
 from app.prediction import size as sz
@@ -12,6 +14,7 @@ from app.prediction.features import feats
 from app.prediction.ml_models import make_models
 from app.utils.constants import COLOR_GROUP, COLOR_NAMES
 
+log = logging.getLogger("wingo.engine")
 ENGINE_VERSION = "1.0.0"
 BASELINE_MODELS = ("CumFreq", "Recent50", "Markov1", "Markov2")
 ML_MODELS = ("LogReg", "RandForest", "HistGB")
@@ -40,9 +43,15 @@ def decide(cons: np.ndarray) -> dict:
 
 
 class PredictionEngine:
-    def __init__(self, refit_every: int = 10, warm: int = 20, use_ml: bool = True, min_ml_history: int = 60):
+    def __init__(self, refit_every: int = 10, warm: int = 20, use_ml: bool = True, min_ml_history: int = 60,
+                 background_refit: bool = False):
+        """background_refit=True (live server only): once a first fit exists, a due refit runs in a worker thread on a snapshot of the data and the
+        request keeps using the current models until the new ones are swapped in. Default False = refit inline (backtests, tests, scripts)."""
         self.refit_every, self.warm, self.use_ml, self.min_ml_history = refit_every, warm, use_ml, min_ml_history
+        self.background_refit = background_refit
         self._models = None; self._fit_n = -1
+        self._fit_lock = threading.Lock()                                  # one fit at a time; also guards the feature-row cache
+        self._spawn_lock, self._refit_running = threading.Lock(), False
         self._cache_seq = np.zeros(0, dtype=int); self._cache_X = []      # feature-row cache (append-only data)
 
     def _rows(self, seq: np.ndarray, upto: int):
@@ -65,6 +74,28 @@ class PredictionEngine:
             m.fit(X, y)
         self._models, self._fit_n = models, n
 
+    def _due(self, n: int) -> bool:
+        return self._models is None or n < self._fit_n or n - self._fit_n >= self.refit_every
+
+    def _refit_in_background(self, h: np.ndarray) -> None:
+        with self._spawn_lock:
+            if self._refit_running:
+                return
+            self._refit_running = True
+        snap = h.copy()
+
+        def work():
+            try:
+                with self._fit_lock:
+                    if self._due(len(snap)):
+                        self._fit(snap)
+            except Exception:                                              # noqa: BLE001 - the current models stay in use
+                log.warning("background model refit failed", exc_info=True)
+            finally:
+                with self._spawn_lock:
+                    self._refit_running = False
+        threading.Thread(target=work, daemon=True, name="refit").start()
+
     def model_scores(self, seq) -> dict:
         h = np.asarray(seq, dtype=int)
         if len(h) < 2:
@@ -72,10 +103,17 @@ class PredictionEngine:
         out = {"CumFreq": baselines.cum_freq(h), "Recent50": baselines.recent_freq(h, 50),
                "Markov1": baselines.markov1(h), "Markov2": baselines.markov2(h)}
         if self.use_ml and len(h) >= self.min_ml_history:
-            if self._models is None or len(h) < self._fit_n or len(h) - self._fit_n >= self.refit_every:
-                self._fit(h)
+            models = self._models
+            if self._due(len(h)):
+                if self.background_refit and models is not None and len(h) >= self._fit_n:
+                    self._refit_in_background(h)                           # keep answering with the current models meanwhile
+                else:
+                    with self._fit_lock:
+                        if self._due(len(h)):                              # another thread may have fitted while we waited
+                            self._fit(h)
+                    models = self._models
             x = feats(h).reshape(1, -1)
-            for k, m in self._models.items():
+            for k, m in models.items():
                 pr = np.zeros(10)
                 classes = m[-1].classes_ if hasattr(m, "steps") else m.classes_
                 pr[classes] = m.predict_proba(x)[0]
