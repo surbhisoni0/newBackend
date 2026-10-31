@@ -4,10 +4,12 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 from app.api.schemas import ImportIn, ResultIn
+from app.clock_cache import ClockServer
 from app.prediction.engine import ENGINE_VERSION
 
 router = APIRouter(prefix="/api")
 MAX_CSV_BYTES = 5_000_000
+CLOCKS = ClockServer()
 
 
 def svc(request: Request):
@@ -19,17 +21,19 @@ def sync_of(request: Request):
 
 
 def _mode(request: Request) -> str:
-    from app.modes import DEFAULT_MODE, MODES
+    from app.modes import DEFAULT_MODE
     m = request.query_params.get("mode") or DEFAULT_MODE
-    if m not in MODES:
-        raise HTTPException(status_code=400, detail=f"unknown mode {m!r}; use one of {list(MODES)}")
+    active = request.app.state.services                             # only the modes this server runs (ENABLED_MODES)
+    if m not in active:
+        raise HTTPException(status_code=400, detail=f"unknown mode {m!r}; use one of {list(active)}")
     return m
 
 
 @router.get("/modes")
 def modes(request: Request):
     from app.modes import DEFAULT_MODE, MODES
-    return {"default": DEFAULT_MODE, "modes": [{"key": k, **v, "feed": request.app.state.syncs[k].enabled} for k, v in MODES.items()]}
+    return {"default": DEFAULT_MODE, "modes": [{"key": k, **v, "feed": request.app.state.syncs[k].enabled} for k, v in MODES.items()
+                                               if k in request.app.state.services]}
 
 
 def require_key(request: Request, x_api_key: Optional[str] = Header(default=None)):
@@ -75,6 +79,12 @@ async def import_paste(request: Request, newest_first: bool = Query(False, descr
     return await run_in_threadpool(svc(request).import_paste, raw.decode("utf-8-sig", errors="replace"), newest_first)
 
 
+@router.get("/ping")
+async def ping():
+    """Zero-cost liveness probe (no database, no worker thread). Use it for uptime monitors / keep-alive pings."""
+    return {"ok": True}
+
+
 @router.get("/health")
 def health(request: Request):
     """Liveness/readiness for the hosting platform. 503 only when the database is unreachable."""
@@ -95,9 +105,14 @@ def latest_result(request: Request):
 
 
 @router.get("/clock")
-def clock(request: Request):
-    """Server time + verified round timing. Light enough to poll every few seconds; contains no model output."""
-    return svc(request).clock()
+async def clock(request: Request):
+    """Server time + verified round timing. Light enough to poll every few seconds; contains no model output.
+    Served from its own thread pool so heavy endpoints can never starve it (see app/clock_cache.py)."""
+    mode = _mode(request)
+    try:
+        return await CLOCKS.get(mode, request.app.state.services[mode])
+    except Exception as e:                                          # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"clock temporarily unavailable: {type(e).__name__}") from e
 
 
 @router.get("/sync/status")
