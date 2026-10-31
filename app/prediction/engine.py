@@ -77,6 +77,23 @@ class PredictionEngine:
     def _due(self, n: int) -> bool:
         return self._models is None or n < self._fit_n or n - self._fit_n >= self.refit_every
 
+    def ready(self, n: int) -> bool:
+        """Live (background_refit) mode only: False while the FIRST fit is still missing, so callers can answer "warming up" instead of
+        blocking on it. Always True in the default inline mode, where a missing fit is simply made on demand."""
+        return (not self.background_refit) or (not self.use_ml) or n < self.min_ml_history or self._models is not None
+
+    def warm_async(self, seq) -> None:
+        """Start (or join) the first fit in a worker thread; never blocks the caller."""
+        self._refit_in_background(np.asarray(seq, dtype=int))
+
+    def wait_ready(self, timeout: float) -> bool:
+        """Wait (bounded) for the first fit. Returns whether the models exist."""
+        import time
+        end = time.time() + max(0.0, timeout)
+        while self._models is None and time.time() < end:
+            time.sleep(0.05)
+        return self._models is not None
+
     def _refit_in_background(self, h: np.ndarray) -> None:
         with self._spawn_lock:
             if self._refit_running:
