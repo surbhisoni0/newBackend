@@ -25,12 +25,13 @@ def feats(h: np.ndarray) -> np.ndarray:
     for w in (5, 10, 20, 50, 100):                          # recent frequency windows
         f += list(np.bincount(h[-w:], minlength=10) / max(1, min(w, t)))
     f += list(np.bincount(h, minlength=10) / t)             # cumulative frequency
+    tail = h[-101:]                                         # the gap is capped at 100, so only the last 101 rounds can matter (same values, O(1) not O(t))
     for d in range(10):                                     # gap since last appearance
-        idx = np.where(h == d)[0]
-        f.append(min(100, t - 1 - idx[-1]) if len(idx) else 100)
+        idx = np.flatnonzero(tail == d)
+        f.append(min(100, len(tail) - 1 - idx[-1]) if len(idx) else 100)
     C = np.ones((10, 10))                                   # smoothed transition row for the previous result
-    for a, b in zip(h[:-1], h[1:]):
-        C[a, b] += 1
+    if t > 1:
+        C += np.bincount(h[:-1] * 10 + h[1:], minlength=100).reshape(10, 10)     # vectorised count of every a->b transition
     f += list(C[h[-1]] / C[h[-1]].sum())
 
     def run(fn):
