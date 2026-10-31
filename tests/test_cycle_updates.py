@@ -64,7 +64,8 @@ class TestCycleUpdates(unittest.TestCase):
         for t in range(0, 30 * 6, 5):
             clock[0] = NOW0 + 0.5 + t; sync.run_once()
             if clock[0] > NOW0 + 45: ids.add(svc.next_prediction()["id"])
-        self.assertEqual(len(ids), 1)                                          # frozen, not re-rolled, across ~4 further cycles
+        self.assertEqual(len({i for i in ids if i is not None}), 1)           # one stored pick, never re-rolled, across ~4 further cycles
+        self.assertLessEqual(ids - {None}, ids)                                # (id None = an unsaved, unscored projection; see test_cycle_refresh.py)
         self.assertEqual(svc.history(50)["total"], 2)
 
 
