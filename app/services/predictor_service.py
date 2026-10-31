@@ -96,6 +96,17 @@ class PredictorService:
         self.repo.save_prediction(pred)
         return self.repo.get_prediction_by_target(target)
 
+    def prewarm(self) -> None:
+        """Fit the models that are due NOW (at start-up, in a background thread) so the first request does not pay for the fit.
+        Same engine, same data: it only moves the work earlier, so the values are unchanged."""
+        try:
+            with self.lock:
+                last = self.repo.last_result()
+                if last and last["seq"] >= self.min_history:
+                    self.engine.model_scores(self._numbers())
+        except Exception:
+            pass
+
     def add_result(self, number, period_id=None, timestamp=None) -> dict:
         with self.lock:
             row = self._store([{"number": number, "period_id": period_id, "timestamp": timestamp}])[0]
