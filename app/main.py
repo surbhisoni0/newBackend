@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
 
 def _build_mode(s, mode: str, m: dict, prewarm: bool = True):
     repo = create_repository(mode_db_url(s.database_url, mode)); repo.init()
-    service = PredictorService(repo, PredictionEngine(refit_every=s.refit_every), s.min_history, s.min_validation_n,
+    service = PredictorService(repo, PredictionEngine(refit_every=s.refit_every, background_refit=True), s.min_history, s.min_validation_n,
                                clock_cfg=s.clock_config(m["seconds"], force_assumed=not m["type_id"]))     # no source for this mode: labelled, assumed timer
     seed = _find_seed(s.seed_csv)
     if mode == DEFAULT_MODE and s.auto_seed and repo.last_result() is None:
