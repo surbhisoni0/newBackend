@@ -22,7 +22,8 @@ from app.utils.constants import BASELINES, METRICS, color_group_of, size_of, COL
 from app.utils.stats import rate_stats
 
 MAX_CLOCK_ROWS = 40
-ROLLING_WINDOWS = (50, 100, 500)   # live accuracy is reported over the last 50 / 100 / 500 resolved predictions
+ROLLING_WINDOWS = (50, 100, 250, 500)   # live accuracy is reported over the last 50 / 100 / 250 / 500 resolved predictions
+CAL_EDGES = (0.5, 0.505, 0.51, 0.52, 0.54, 1.01)   # bins of the model's stated probability for the side it picked
 SETTLE_SECONDS = 5.0      # after a cycle boundary the ended round's verified result gets this long to arrive before a projection is built
 DISCLAIMER = ("Model-generated statistical candidates, not predictions of a guaranteed outcome. Walk-forward validation on "
               "historical data has shown no reliable advantage over random guessing. Nothing here places bets.")
@@ -385,6 +386,7 @@ class PredictorService:
         windows = {m: {str(w): self._window(outs, keys[m], BASELINES[m], w) for w in ROLLING_WINDOWS} for m in METRICS}
         return {"disclaimer": DISCLAIMER, "baselines": BASELINES, "signal": self.current_signal(),
                 "live": {"total_predictions": live["top1"]["n"], "metrics": live, "series": series, "windows": windows,
+                         "by_side": self._by_side(outs), "calibration": self._calibration(outs),
                          "note": "Live = predictions made before the actual result arrived. Needs 100+ to mean anything."},
                 "backtest": None if not bt else {"id": bt["id"], **bt["summary"]}}
 
@@ -395,6 +397,29 @@ class PredictorService:
         st = rate_stats(hits, baseline)
         return {"window": w, "n": st["n"], "correct": st["k"], "incorrect": st["n"] - st["k"], "rate": st["rate"], "lo": st["lo"], "hi": st["hi"],
                 "baseline": baseline, "full": st["n"] >= w}
+
+    @staticmethod
+    def _by_side(outs: list) -> dict:
+        """Accuracy of the Big picks and of the Small picks separately (each against a 50% coin flip). Every stored pick counts, none is dropped."""
+        res = {}
+        for side in ("Big", "Small"):
+            st = rate_stats([bool(o["outcome"]["bs_hit"]) for o in outs if o.get("size") == side], 0.5)
+            res[side] = {"n": st["n"], "correct": st["k"], "incorrect": st["n"] - st["k"], "rate": st["rate"], "lo": st["lo"], "hi": st["hi"]}
+        return res
+
+    @staticmethod
+    def _calibration(outs: list) -> list:
+        """What the model SAID (probability for its picked side) vs what actually happened. Honest calibration = stated close to actual; a model with
+        no edge shows stated 51-54% but actual ~50%. Picks stored before size_probs existed are skipped (they have no stated probability)."""
+        rows = [(max(o["size_probs"]["Big"], o["size_probs"]["Small"]), bool(o["outcome"]["bs_hit"])) for o in outs
+                if o.get("size_probs") and o["size_probs"].get("Big") is not None]
+        bins = []
+        for lo, hi in zip(CAL_EDGES[:-1], CAL_EDGES[1:]):
+            sel = [(p, h) for p, h in rows if lo <= p < hi]
+            st = rate_stats([h for _, h in sel], 0.5)
+            bins.append({"from": lo, "to": min(hi, 1.0), "n": st["n"], "stated": (sum(p for p, _ in sel) / len(sel)) if sel else None,
+                         "actual": st["rate"], "lo": st["lo"], "hi": st["hi"]})
+        return bins
 
     def _confidence(self, shown: Optional[dict]) -> Optional[dict]:
         """Confidence for the Big/Small pick that can be defended. The raw model probability is NOT used as confidence: it is an uncalibrated
@@ -410,7 +435,9 @@ class PredictorService:
         cal = max(0.5, float(v["lo"])) if v and v.get("lo") is not None else 0.5
         basis = ("lower bound of the walk-forward hit rate (validated edge)" if cal > 0.5 else
                  "no validated edge: on unseen rounds this model is not distinguishable from a coin flip")
-        return {"pick": shown.get("size"), "raw_model_probability": round(float(raw), 4), "calibrated": round(cal, 4), "signal": level, "basis": basis}
+        abstain = level not in ("moderate", "strong")        # no validated edge -> the honest output is NO PREDICTION (the estimate is still stored and scored)
+        return {"pick": shown.get("size"), "raw_model_probability": round(float(raw), 4), "calibrated": round(cal, 4), "signal": level, "basis": basis,
+                "abstain": abstain, "recommendation": "NO PREDICTION" if abstain else shown.get("size")}
 
     def stats_report(self) -> dict:
         out = self._memo("stats_report", self._stats_report)
