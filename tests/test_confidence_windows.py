@@ -42,6 +42,13 @@ class Windows(unittest.TestCase):
             if h["result"] != "PENDING":
                 self.assertIsNotNone(h["actual"])
 
+    def test_incremental_numbers_equal_full_read(self):
+        got = self.svc._numbers()
+        full = np.array(self.svc.repo.get_numbers(), dtype=int)
+        self.assertTrue(np.array_equal(got, full))                   # extended from the cache, identical to a full database read
+        self.assertEqual(len(got), self.svc.repo.last_result()["seq"])
+        self.assertFalse(got.flags.writeable)
+
     def test_confidence_is_a_coin_flip_without_validated_edge(self):
         p = self.svc.next_prediction()
         c = p["confidence"]
