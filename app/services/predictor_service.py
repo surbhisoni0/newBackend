@@ -22,6 +22,7 @@ from app.utils.constants import BASELINES, METRICS, color_group_of, size_of, COL
 from app.utils.stats import rate_stats
 
 MAX_CLOCK_ROWS = 40
+ROLLING_WINDOWS = (50, 100, 500)   # live accuracy is reported over the last 50 / 100 / 500 resolved predictions
 SETTLE_SECONDS = 5.0      # after a cycle boundary the ended round's verified result gets this long to arrive before a projection is built
 DISCLAIMER = ("Model-generated statistical candidates, not predictions of a guaranteed outcome. Walk-forward validation on "
               "historical data has shown no reliable advantage over random guessing. Nothing here places bets.")
@@ -296,7 +297,7 @@ class PredictorService:
             kind = "projection" if shown is not p else "pick"
             wait = (SETTLE_SECONDS - into if settling else P - into + (SETTLE_SECONDS if missed == 0 else 0.0)) + 0.5
             return {"available": True, "latest_result": last, "estimate_state": "projection" if kind == "projection" else est,
-                    "timing": timing, **self._public(shown), "kind": kind, "settling": settling, "unverified_cycles": missed,
+                    "timing": timing, **self._public(shown), "confidence": self._confidence(shown), "kind": kind, "settling": settling, "unverified_cycles": missed,
                     "cycle": {"index": cur, "started_at": iso(started), "ends_at": iso(started + P), "seconds_into": round(into, 3),
                               "period_seconds": int(P)},
                     "refresh_in_ms": int(wait * 1000)}
@@ -343,10 +344,35 @@ class PredictorService:
             step = max(1, len(cum) // 200)
             series[m] = [{"n": i + 1, "rate": float(cum[i] / (i + 1))} for i in range(0, len(cum), step)]
         bt = self.repo.latest_backtest()
+        windows = {m: {str(w): self._window(outs, keys[m], BASELINES[m], w) for w in ROLLING_WINDOWS} for m in METRICS}
         return {"disclaimer": DISCLAIMER, "baselines": BASELINES, "signal": self.current_signal(),
-                "live": {"total_predictions": live["top1"]["n"], "metrics": live, "series": series,
+                "live": {"total_predictions": live["top1"]["n"], "metrics": live, "series": series, "windows": windows,
                          "note": "Live = predictions made before the actual result arrived. Needs 100+ to mean anything."},
                 "backtest": None if not bt else {"id": bt["id"], **bt["summary"]}}
+
+    @staticmethod
+    def _window(outs: list, key: str, baseline: float, w: int) -> dict:
+        """Accuracy over the LAST `w` resolved live predictions (picks made before their round ended). Fewer than `w` exist -> uses what exists and says so."""
+        hits = [bool(o["outcome"][key]) for o in outs[-w:]]
+        st = rate_stats(hits, baseline)
+        return {"window": w, "n": st["n"], "correct": st["k"], "incorrect": st["n"] - st["k"], "rate": st["rate"], "lo": st["lo"], "hi": st["hi"],
+                "baseline": baseline, "full": st["n"] >= w}
+
+    def _confidence(self, shown: Optional[dict]) -> Optional[dict]:
+        """Confidence for the Big/Small pick that can be defended. The raw model probability is NOT used as confidence: it is an uncalibrated
+        score. A pick may only claim more than 50% when walk-forward validation proved an edge (signal moderate/strong); then the claim is the
+        LOWER bound of the measured hit rate, never the optimistic estimate. Otherwise it is 50% - a coin flip."""
+        sp = (shown or {}).get("size_probs") or {}
+        if sp.get("Big") is None:
+            return None
+        raw = max(sp["Big"], sp["Small"])
+        sig = (shown.get("signal") or {})
+        level = sig.get("level", "none")
+        v = (self._validation() or {}).get("metrics", {}).get("bs") if level in ("moderate", "strong") else None
+        cal = max(0.5, float(v["lo"])) if v and v.get("lo") is not None else 0.5
+        basis = ("lower bound of the walk-forward hit rate (validated edge)" if cal > 0.5 else
+                 "no validated edge: on unseen rounds this model is not distinguishable from a coin flip")
+        return {"pick": shown.get("size"), "raw_model_probability": round(float(raw), 4), "calibrated": round(cal, 4), "signal": level, "basis": basis}
 
     def stats_report(self) -> dict:
         out = self._memo("stats_report", self._stats_report)
