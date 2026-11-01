@@ -41,6 +41,7 @@ class PredictorService:
         self._proj = None                                   # the one projection built for the current cycle (never stored)
         self._nums_cache = None                             # (key of newest round, read-only numpy array)
         self._memos = {}                                    # report name -> (data key, report)
+        self._outs = None                                   # resolved predictions (with outcome), oldest first; read from the database ONCE, then extended in _resolve
 
     # ------------------------------------------------------------ helpers
     def _numbers(self) -> np.ndarray:
@@ -73,8 +74,16 @@ class PredictorService:
         self._memos[name] = (key, v)
         return dict(v)
 
+    def _all_outcomes(self) -> list:
+        """Every resolved live prediction, oldest first. Re-reading ALL of them (outcomes + predictions) from the database on every new round, twice
+        and under the service lock, took ~47 s on a hosted database once a few thousand picks existed - the new estimate then appeared a whole cycle
+        late and page requests queued behind the lock. Outcomes only change in _resolve, so they are loaded once and extended there. Same values."""
+        if self._outs is None:
+            self._outs = list(self.repo.all_outcomes())
+        return self._outs
+
     def live_metrics(self) -> dict:
-        outs = [o["outcome"] for o in self.repo.all_outcomes()]
+        outs = [o["outcome"] for o in self._all_outcomes()]
         keys = {"top1": "top1_hit", "top3": "top3_hit", "bs": "bs_hit", "color": "color_hit"}
         return {m: rate_stats([o[keys[m]] for o in outs], BASELINES[m]) for m in METRICS}
 
@@ -108,6 +117,11 @@ class PredictorService:
                    "bs_hit": pred["size"] == size_of(a), "color_hit": pred["color"] == COLOR_NAMES[color_group_of(a)]}
         self.repo.resolve_prediction(pred["id"], outcome)          # resolve first ...
         self.repo.expire_pending_except(row["seq"] + 1)            # ... then void anything stale
+        if self._outs is not None:                                 # keep the in-memory list identical to what the database now holds
+            if not self._outs or pred["target_seq"] > self._outs[-1]["target_seq"]:
+                self._outs.append({**pred, "status": "resolved", "outcome": outcome})
+            else:
+                self._outs = None                                  # out-of-order (should not happen): reload once, never guess
         live = self.live_metrics()
         self.repo.save_snapshot({"n": live["top1"]["n"], **{k: live[k]["rate"] for k in METRICS}})
         return {**pred, "status": "resolved", "outcome": outcome}
@@ -139,6 +153,11 @@ class PredictorService:
     def prewarm(self) -> None:
         """Fit the models that are due NOW (at start-up, in a background thread) so the first request does not pay for the fit.
         Same engine, same data: it only moves the work earlier, so the values are unchanged."""
+        try:
+            with self.lock:                                # load the resolved-outcome history once, now, instead of inside the first live round
+                self._all_outcomes()
+        except Exception:
+            pass
         try:                                               # no service lock: the engine has its own fit lock, so sync and page reads are not blocked by the fit
             last = self.repo.last_result()
             if last and last["seq"] >= self.min_history:
@@ -335,7 +354,7 @@ class PredictorService:
         return self._memo("performance", self._performance)
 
     def _performance(self) -> dict:
-        outs = self.repo.all_outcomes()
+        outs = list(self._all_outcomes())
         live = self.live_metrics()
         keys = {"top1": "top1_hit", "top3": "top3_hit", "bs": "bs_hit", "color": "color_hit"}
         series = {m: [] for m in METRICS}
