@@ -49,6 +49,22 @@ class Windows(unittest.TestCase):
         self.assertEqual(len(got), self.svc.repo.last_result()["seq"])
         self.assertFalse(got.flags.writeable)
 
+    def test_by_side_and_calibration_add_up(self):
+        live = self.svc.performance()["live"]
+        sides = live["by_side"]
+        self.assertEqual(sides["Big"]["n"] + sides["Small"]["n"], live["total_predictions"])
+        for sd in sides.values():
+            self.assertEqual(sd["correct"] + sd["incorrect"], sd["n"])
+        cal = live["calibration"]
+        self.assertEqual(sum(b["n"] for b in cal), live["total_predictions"])
+        for b in cal:
+            if b["n"]:
+                self.assertGreaterEqual(b["stated"], b["from"]); self.assertLess(b["stated"], max(b["to"], 1.0001))
+
+    def test_no_prediction_when_no_validated_edge(self):
+        c = self.svc.next_prediction()["confidence"]
+        self.assertTrue(c["abstain"]); self.assertEqual(c["recommendation"], "NO PREDICTION")
+
     def test_confidence_is_a_coin_flip_without_validated_edge(self):
         p = self.svc.next_prediction()
         c = p["confidence"]
