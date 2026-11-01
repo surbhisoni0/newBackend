@@ -1,74 +1,451 @@
-"""Rolling-window live accuracy (50/100/500) and the honest confidence figure. No mocked results: rounds come from the real stored history."""
-import unittest
-from pathlib import Path
+"""Orchestrates: validate -> store -> resolve previous prediction -> update live accuracy -> predict next.
+
+No betting/deposit/withdrawal/auto-bet functionality exists anywhere in this project; this service only
+records data, produces statistical candidates and measures how they perform.
+"""
+import threading
+import time
+from typing import Callable, Optional
 import numpy as np
-from app.database.memory_repo import InMemoryRepository
+from app.backtesting.walk_forward import run_walk_forward
+from app.database.base import Repository
 from app.prediction.engine import PredictionEngine
-from app.services.predictor_service import PredictorService, ROLLING_WINDOWS
+from app.prediction.signal import evaluate_signal
+from app.services import analysis
+from app.services.colour_analysis import colour_analysis
+from app.services.size_analysis import size_analysis
+from app.services.stats_report import accuracy_report, daily_summary, hot_cold, streaks
+from app.services.data_service import clean_rows, parse_csv, parse_paste
+from app.services.errors import ServiceError, ValidationFailure
+from app.timing import ClockConfig, advance_period_id, assumed_countdown, countdown, iso, next_period_id, parse_ts, verify_schedule
+from app.utils.constants import BASELINES, METRICS, color_group_of, size_of, COLOR_NAMES
+from app.utils.stats import rate_stats
 
-CSV = Path(__file__).resolve().parents[1] / "data" / "wingo_docx_clean.csv"
+MAX_CLOCK_ROWS = 40
+ROLLING_WINDOWS = (50, 100, 500)   # live accuracy is reported over the last 50 / 100 / 500 resolved predictions
+SETTLE_SECONDS = 5.0      # after a cycle boundary the ended round's verified result gets this long to arrive before a projection is built
+DISCLAIMER = ("Model-generated statistical candidates, not predictions of a guaranteed outcome. Walk-forward validation on "
+              "historical data has shown no reliable advantage over random guessing. Nothing here places bets.")
 
 
-class Windows(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        rows = CSV.read_text().splitlines()
-        cls.svc = PredictorService(InMemoryRepository(), PredictionEngine(background_refit=False), 100, 300)
-        cls.svc.import_csv("\n".join(rows[:1001]))                 # header + 1000 real rounds as history
-        cls.live = rows[1001:1061]                                  # 60 later real rounds, fed one by one -> each resolves the pick made before it
-        for line in cls.live:
-            cls.svc.next_prediction()                               # the pick for the next round is made BEFORE its result exists
-            _, num, *_ = line.split(",")
-            cls.svc.add_result(int(num), period_id=line.split(",")[0])
+class PredictorService:
+    def __init__(self, repo: Repository, engine: PredictionEngine, min_history: int = 100, min_validation_n: int = 300,
+                 clock_cfg: Optional[ClockConfig] = None, now_fn: Callable[[], float] = time.time):
+        self.repo, self.engine = repo, engine
+        self.clock_cfg, self.now_fn = clock_cfg or ClockConfig(), now_fn
+        self.min_history, self.min_validation_n = min_history, min_validation_n
+        self.lock = threading.RLock()
+        self.warm_wait_seconds = 8.0                        # a page request waits at most this long (outside the lock) for the first model fit
+        self.backtest_state = {"status": "idle", "progress": 0, "total": 0, "error": None}
+        self.live_source = None
+        self._proj = None                                   # the one projection built for the current cycle (never stored)
+        self._nums_cache = None                             # (key of newest round, read-only numpy array)
+        self._memos = {}                                    # report name -> (data key, report)
+        self._outs = None                                   # resolved predictions (with outcome), oldest first; read from the database ONCE, then extended in _resolve
 
-    def test_windows_are_consistent_with_history(self):
-        perf = self.svc.performance()
-        hist = self.svc.history(500)["predictions"]
-        done = [h for h in hist if h["result"] in ("HIT", "MISS")]
-        w = perf["live"]["windows"]["bs"]
-        self.assertEqual(set(w), {str(x) for x in ROLLING_WINDOWS})
-        for size in ROLLING_WINDOWS:
-            x = w[str(size)]
-            last = sorted(done, key=lambda h: h["target_seq"])[-size:]
-            self.assertEqual(x["n"], len(last))                      # uses only what exists
-            self.assertEqual(x["correct"], sum(h["result"] == "HIT" for h in last))
-            self.assertEqual(x["correct"] + x["incorrect"], x["n"])
-            self.assertEqual(x["full"], len(done) >= size)
-        self.assertEqual(perf["live"]["total_predictions"], len(done))
-        self.assertGreater(len(done), 0)
+    # ------------------------------------------------------------ helpers
+    def _numbers(self) -> np.ndarray:
+        """All stored numbers, oldest first. The history only ever grows, so it is re-read from the database ONLY when the newest stored round
+        changed (one cheap indexed query decides that). Before, every page request, poll and prediction re-read all rows (several times per call).
+        Values are identical; the array is read-only so no caller can corrupt the shared copy."""
+        last = self.repo.last_result()
+        key = (last["seq"], last.get("period_id"), last["number"]) if last else None
+        c = self._nums_cache
+        if key is not None and c is not None:
+            if c[0] == key:
+                return c[1]
+            arr = self._extend_numbers(c, last)                  # a few new rounds: read ONLY those, not the whole history again
+            if arr is not None:
+                self._nums_cache = (key, arr, last["seq"])
+                return arr
+        arr = np.array(self.repo.get_numbers(), dtype=int)
+        arr.setflags(write=False)
+        if key is not None:
+            self._nums_cache = (key, arr, last["seq"])
+        return arr
 
-    def test_every_pick_was_made_before_its_result(self):
-        for h in self.svc.history(500)["predictions"]:
-            if h["result"] != "PENDING":
-                self.assertIsNotNone(h["actual"])
+    def _extend_numbers(self, cached: tuple, last: dict) -> Optional[np.ndarray]:
+        """cached history + the rounds stored after it, or None (-> caller does one full read) if anything about them is not exactly contiguous."""
+        prev_seq = cached[2]
+        delta = last["seq"] - prev_seq
+        if not 0 < delta <= 500:
+            return None
+        rows, _ = self.repo.list_results(delta, 0)               # newest first
+        rows = rows[::-1]
+        if len(rows) != delta or any(r["seq"] != prev_seq + 1 + i for i, r in enumerate(rows)) or len(cached[1]) != prev_seq:
+            return None
+        arr = np.concatenate([cached[1], np.array([r["number"] for r in rows], dtype=int)])
+        arr.setflags(write=False)
+        return arr
 
-    def test_incremental_numbers_equal_full_read(self):
-        got = self.svc._numbers()
-        full = np.array(self.svc.repo.get_numbers(), dtype=int)
-        self.assertTrue(np.array_equal(got, full))                   # extended from the cache, identical to a full database read
-        self.assertEqual(len(got), self.svc.repo.last_result()["seq"])
-        self.assertFalse(got.flags.writeable)
+    def _data_key(self) -> tuple:
+        """Everything the heavy read-only reports depend on: the newest round (live outcomes only change with a new round) and the latest backtest."""
+        last, bt = self.repo.last_result(), self.repo.latest_backtest()
+        return (last["seq"] if last else 0, last.get("period_id") if last else None, bt["id"] if bt else None)
 
-    def test_confidence_is_a_coin_flip_without_validated_edge(self):
-        p = self.svc.next_prediction()
-        c = p["confidence"]
-        self.assertEqual(c["signal"], "none")
-        self.assertEqual(c["calibrated"], 0.5)                       # never above 50% without validation
-        self.assertGreaterEqual(c["raw_model_probability"], 0.5)
-        self.assertEqual(c["pick"], p["size"])
+    def _memo(self, name: str, fn: Callable[[], dict]) -> dict:
+        """Compute a heavy report once per (new round / new backtest) instead of on every request. Same values: it is only a cache."""
+        key = self._data_key()
+        c = self._memos.get(name)
+        if c is not None and c[0] == key:
+            return dict(c[1])
+        v = fn()
+        self._memos[name] = (key, v)
+        return dict(v)
 
-    def test_confidence_never_exceeds_validated_lower_bound(self):
-        shown = {"size": "Big", "size_probs": {"Big": 0.9, "Small": 0.1}, "signal": {"level": "moderate"}}
-        orig = self.svc._validation
-        self.svc._validation = lambda: {"metrics": {"bs": {"lo": 0.53, "rate": 0.6}}}
+    def _all_outcomes(self) -> list:
+        """Every resolved live prediction, oldest first. Re-reading ALL of them (outcomes + predictions) from the database on every new round, twice
+        and under the service lock, took ~47 s on a hosted database once a few thousand picks existed - the new estimate then appeared a whole cycle
+        late and page requests queued behind the lock. Outcomes only change in _resolve, so they are loaded once and extended there. Same values."""
+        if self._outs is None:
+            self._outs = list(self.repo.all_outcomes())
+        return self._outs
+
+    def live_metrics(self) -> dict:
+        outs = [o["outcome"] for o in self._all_outcomes()]
+        keys = {"top1": "top1_hit", "top3": "top3_hit", "bs": "bs_hit", "color": "color_hit"}
+        return {m: rate_stats([o[keys[m]] for o in outs], BASELINES[m]) for m in METRICS}
+
+    def _validation(self) -> Optional[dict]:
+        bt = self.repo.latest_backtest()
+        if not bt:
+            return None
+        s = bt["summary"]
+        return {"metrics": s["consensus"], "K": s["K"], "data_n": s["data_n"], "run_at": s["created_at"]}
+
+    def current_signal(self) -> dict:
+        v = self._validation()
+        sig = evaluate_signal(v, self.live_metrics(), min_n=self.min_validation_n)
+        sig["validated_on"] = None if not v else {"data_n": v["data_n"], "run_at": v["run_at"]}
+        return sig
+
+    # ------------------------------------------------------------ data flow
+    def _store(self, items: list) -> list:
+        last = self.repo.last_result()
+        have = self.repo.existing_periods([str(it["period_id"]).strip() for it in items if isinstance(it, dict) and it.get("period_id")])
+        cleaned = clean_rows(items, last["period_id"] if last else None, lambda pid: pid in have)
+        return self.repo.add_results(cleaned)
+
+    def _resolve(self, row: dict) -> Optional[dict]:
+        pred = self.repo.get_prediction_by_target(row["seq"])
+        if not pred or pred["status"] != "pending":
+            self.repo.expire_pending_except(row["seq"] + 1)
+            return None
+        a = row["number"]
+        outcome = {"actual": a, "top1_hit": pred["top1"] == a, "top3_hit": a in pred["top3"],
+                   "bs_hit": pred["size"] == size_of(a), "color_hit": pred["color"] == COLOR_NAMES[color_group_of(a)]}
+        self.repo.resolve_prediction(pred["id"], outcome)          # resolve first ...
+        self.repo.expire_pending_except(row["seq"] + 1)            # ... then void anything stale
+        if self._outs is not None:                                 # keep the in-memory list identical to what the database now holds
+            if not self._outs or pred["target_seq"] > self._outs[-1]["target_seq"]:
+                self._outs.append({**pred, "status": "resolved", "outcome": outcome})
+            else:
+                self._outs = None                                  # out-of-order (should not happen): reload once, never guess
+        live = self.live_metrics()
+        self.repo.save_snapshot({"n": live["top1"]["n"], **{k: live[k]["rate"] for k in METRICS}})
+        return {**pred, "status": "resolved", "outcome": outcome}
+
+    def _next_prediction(self) -> Optional[dict]:
+        last = self.repo.last_result()
+        if not last or last["seq"] < self.min_history:
+            return None
+        target = last["seq"] + 1
+        existing = self.repo.get_prediction_by_target(target)
+        if existing and existing["status"] == "pending":
+            return existing
+        if not self._models_ready():                       # first model fit after a restart still running: do not block on it, the pick is made once it is ready
+            return None
+        p = self.engine.predict(self._numbers())
+        lp = last["period_id"]
+        pred = {**p, "target_seq": target, "target_period": next_period_id(lp),
+                "signal": self.current_signal(), "made_at": self.now_fn()}
+        self.repo.save_prediction(pred)
+        return self.repo.get_prediction_by_target(target)
+
+    def _models_ready(self) -> bool:
+        nums = self._numbers()
+        if self.engine.ready(len(nums)):
+            return True
+        self.engine.warm_async(nums)                       # idempotent: joins the fit that is already running
+        return False
+
+    def prewarm(self) -> None:
+        """Fit the models that are due NOW (at start-up, in a background thread) so the first request does not pay for the fit.
+        Same engine, same data: it only moves the work earlier, so the values are unchanged."""
         try:
-            c = self.svc._confidence(shown)
-            self.assertEqual(c["calibrated"], 0.53)                  # lower bound, not the 90% raw score and not the 60% point estimate
-            shown["signal"] = {"level": "weak"}
-            self.assertEqual(self.svc._confidence(shown)["calibrated"], 0.5)
-        finally:
-            self.svc._validation = orig
+            with self.lock:                                # load the resolved-outcome history once, now, instead of inside the first live round
+                self._all_outcomes()
+        except Exception:
+            pass
+        try:                                               # no service lock: the engine has its own fit lock, so sync and page reads are not blocked by the fit
+            last = self.repo.last_result()
+            if last and last["seq"] >= self.min_history:
+                self.engine.model_scores(self._numbers())
+        except Exception:
+            pass
 
+    def add_result(self, number, period_id=None, timestamp=None) -> dict:
+        with self.lock:
+            row = self._store([{"number": number, "period_id": period_id, "timestamp": timestamp}])[0]
+            resolved = self._resolve(row)
+            nxt = self._next_prediction()
+            return {"result": row, "resolved_prediction": resolved, "next_prediction": self._public(nxt),
+                    "live_performance": self.live_metrics()}
 
-if __name__ == "__main__":
-    unittest.main()
+    def import_rows(self, rows: list) -> dict:
+        if not rows:
+            raise ValidationFailure("nothing to import: no rows provided")
+        with self.lock:
+            stored = self._store(rows)
+            if not stored:
+                raise ValidationFailure("nothing to import: no valid rows provided")
+            self._resolve(stored[0])                       # a pending prediction can only target the first new round
+            self.repo.expire_pending_except(stored[-1]["seq"] + 1)
+            nxt = self._next_prediction()
+            return {"imported": len(stored), "total": self.repo.last_result()["seq"], "next_prediction": self._public(nxt)}
+
+    def import_csv(self, text: str, newest_first: bool = False) -> dict:
+        return self.import_rows(parse_csv(text, newest_first))
+
+    def import_paste(self, text: str, newest_first: bool = False) -> dict:
+        return self.import_rows(parse_paste(text, newest_first))
+
+    # ------------------------------------------------------------ reads
+    @staticmethod
+    def _public(p: Optional[dict]) -> Optional[dict]:
+        if p is None:
+            return None
+        tp = p.get("target_period")
+        return {**p, "target_label": tp or f"#{p['target_seq']}", "target_id_kind": "period_id" if tp else "sequence",
+                "disclaimer": DISCLAIMER}
+
+    def clock(self, now: Optional[float] = None) -> dict:
+        """Server-authoritative timing. Cheap (no model work): safe to poll. The countdown exists ONLY if the schedule is
+        verified from stored timestamps; otherwise `countdown.state` is 'unverified' and says why."""
+        now = self.now_fn() if now is None else now
+        rows, total = self.repo.list_results(MAX_CLOCK_ROWS, 0)
+        base = {"server_time": iso(now), "server_epoch_ms": int(now * 1000), "total_results": total}
+        if not rows:
+            cd = {"state": "no_data", "round_ends_at": None, "seconds_remaining": None,
+                  "overdue_seconds": None, "rounds_ended_since_confirmed": None, "reason": None}
+            if self.clock_cfg.assumed:
+                cd = assumed_countdown(now, self.clock_cfg); cd["round_ends_at"] = iso(cd["round_ends_at"])
+            cd = self._live_round(now, {}) or cd
+            return {**base, "schedule": {"verified": False, "reason": "No confirmed results stored yet."}, "latest_confirmed": None,
+                    "next_round": None, "countdown": cd}
+        latest = rows[0]
+        sched = verify_schedule(rows, self.clock_cfg)
+        cd = countdown(sched, now, self.clock_cfg)
+        if self.clock_cfg.assumed and cd["state"] == "unverified":          # opt-in fallback; a verified schedule always wins
+            cd = {**assumed_countdown(now, self.clock_cfg), "reason": (sched.get("reason") or "") + " Showing an ASSUMED schedule instead."}
+        cd["round_ends_at"] = iso(cd["round_ends_at"])
+        live = self._live_round(now, latest)
+        if live:
+            cd = live
+        nxt_id = next_period_id(latest.get("period_id"))
+        sched_public = {k: v for k, v in sched.items() if k not in ("anchor_epoch",)}
+        sched_public["anchor_time"] = iso(sched["anchor_epoch"])
+        sched_public["late_grace_seconds"] = self.clock_cfg.late_grace_seconds
+        return {**base, "schedule": sched_public,
+                "latest_confirmed": {**latest, "colour": COLOR_NAMES[color_group_of(latest["number"])], "size": size_of(latest["number"])},
+                "next_round": {"period_id": nxt_id, "seq": latest["seq"] + 1, "label": nxt_id or f"#{latest['seq'] + 1}",
+                               "id_kind": "period_id" if nxt_id else "sequence"},
+                "countdown": cd}
+
+    def _live_round(self, now: float, latest: dict) -> Optional[dict]:
+        """Current round taken from the live feed's OPEN round (id + end time), corrected by the feed's clock offset.
+        Between polls the round is rolled forward on the feed's own fixed schedule; stale feed -> None (fall back)."""
+        src = self.live_source
+        op = getattr(src, "open_round", None) if src else None
+        P = float(self.clock_cfg.period_seconds)
+        if not op or not op.get("end") or not src.fetched_at or now - src.fetched_at > 3 * P + 30:
+            return None
+        t = now + (src.clock_offset or 0)
+        k = 0 if t < op["end"] else int((t - op["end"]) // P) + 1
+        cur, ends = advance_period_id(op["period_id"], k), op["end"] + k * P
+        lp = latest.get("period_id")
+        pending = []
+        p = next_period_id(lp)
+        while p and cur and int(p) < int(cur) and len(pending) < 10:
+            pending.append(p); p = next_period_id(p)
+        return {"state": "open", "source": "feed", "id_source": "feed" if k == 0 else "feed+schedule",
+                "current_period": cur, "next_period": next_period_id(cur), "round_ends_at": iso(ends - (src.clock_offset or 0)),
+                "seconds_remaining": max(0.0, ends - t), "period_seconds": int(P), "overdue_seconds": None,
+                "rounds_ended_since_confirmed": len(pending), "awaiting_results": pending,
+                "upstream_clock_offset_seconds": src.clock_offset, "feed_age_seconds": round(now - src.fetched_at, 1), "reason": None}
+
+    # ------------------------------------------------------------ cycles
+    @staticmethod
+    def _cycle_index(t: float, phase: float, P: float) -> int:
+        return int((t - phase) // P)
+
+    def _projection(self, last: dict, cyc: int, missed: int, timing: dict, now: float) -> dict:
+        """The estimate for the round now running when the round(s) before it still have no verified result.
+
+        Same engine, same verified history -> deterministic: it changes ONLY when the verified history changes, never at random.
+        Built once per cycle (cached by cycle + history length), held steady for the whole countdown. It is never written to the
+        database and never scored, so live accuracy still counts only picks that were made before their own round ended."""
+        key = (cyc, last["seq"])
+        if self._proj and self._proj["key"] == key:
+            return self._proj["pred"]
+        p = self.engine.predict(self._numbers())
+        label = (timing["countdown"] or {}).get("current_period") or advance_period_id(last.get("period_id"), missed + 1)
+        pred = {**p, "id": None, "status": "projection", "outcome": None, "target_seq": last["seq"] + 1 + missed,
+                "target_period": label, "created_at": iso(now), "signal": self.current_signal()}
+        self._proj = {"key": key, "pred": pred}
+        return pred
+
+    def _await_models(self) -> None:
+        """Before taking the lock: give a first fit a bounded chance to finish, so a fast server answers normally right after a restart and a slow
+        one answers "warming up" instead of hanging."""
+        nums = self._numbers()
+        if not self.engine.ready(len(nums)):
+            self.engine.warm_async(nums)
+            self.engine.wait_ready(self.warm_wait_seconds)
+
+    def next_prediction(self) -> dict:
+        self._await_models()
+        now = self.now_fn()
+        with self.lock:                                       # one consistent view: pick, newest result, clock and projection
+            p = self._next_prediction()
+            last = self.repo.last_result()
+            timing = self.clock(now)
+            if p is None:
+                if last and last["seq"] >= self.min_history:      # enough data: the models are simply still being fitted after a restart
+                    return {"available": False, "warming": True, "timing": timing, "disclaimer": DISCLAIMER,
+                            "reason": "The prediction models are warming up after a server restart. The estimate appears here automatically in a moment."}
+                return {"available": False, "reason": f"Need at least {self.min_history} results (have {last['seq'] if last else 0}).",
+                        "timing": timing, "disclaimer": DISCLAIMER}
+            state = timing["countdown"]["state"]
+            # A stored pick is bound to ONE round and is only ever scored against that round's verified result.
+            # estimate_state tells the UI whether that round has already ended without a confirmed result.
+            est = {"open": "open", "awaiting_result": "round_ended", "late": "round_ended"}.get(state, "timing_unverified")
+            P = float(self.clock_cfg.period_seconds)
+            end = parse_ts((timing["countdown"] or {}).get("round_ends_at"))
+            phase = 0.0 if end is None else end % P            # cycle boundaries fall where the on-screen countdown puts them
+            cur = self._cycle_index(now, phase, P)
+            started = cur * P + phase
+            into = max(0.0, now - started)
+            made = p.get("made_at")
+            if made is None:                                   # picks stored before made_at existed
+                made = parse_ts(p.get("created_at")) or now
+            missed = max(0, cur - self._cycle_index(min(made, now), phase, P))     # cycles finished since this pick was made
+            settling = missed == 1 and into < SETTLE_SECONDS   # normal case: the ended round's result is a moment away
+            shown = self._projection(last, cur, missed, timing, now) if missed >= 1 and not settling and self._models_ready() else p
+            kind = "projection" if shown is not p else "pick"
+            wait = (SETTLE_SECONDS - into if settling else P - into + (SETTLE_SECONDS if missed == 0 else 0.0)) + 0.5
+            return {"available": True, "latest_result": last, "estimate_state": "projection" if kind == "projection" else est,
+                    "timing": timing, **self._public(shown), "confidence": self._confidence(shown), "kind": kind, "settling": settling, "unverified_cycles": missed,
+                    "cycle": {"index": cur, "started_at": iso(started), "ends_at": iso(started + P), "seconds_into": round(into, 3),
+                              "period_seconds": int(P)},
+                    "refresh_in_ms": int(wait * 1000)}
+
+    def results(self, limit=50, offset=0) -> dict:
+        rows, total = self.repo.list_results(limit, offset)
+        return {"total": total, "results": rows}
+
+    def history(self, limit=50, offset=0) -> dict:
+        rows, total = self.repo.list_predictions(limit, offset)
+        return {"total": total, "predictions": [self._history_row(r) for r in rows]}
+
+    @staticmethod
+    def _history_row(r: dict) -> dict:
+        o = r.get("outcome")
+        result = "PENDING" if not o else ("HIT" if o["bs_hit"] else "MISS")          # Big/Small is the target
+        return {"target_seq": r["target_seq"], "round": r["target_period"] or f"#{r['target_seq']}", "created_at": r["created_at"],
+                "prediction": r["top1"], "top3": r["top3"], "size": r["size"], "color": r["color"],
+                "signal": (r.get("signal") or {}).get("label"), "actual": o["actual"] if o else None,
+                "top3_hit": o["top3_hit"] if o else None, "bs_hit": o["bs_hit"] if o else None,
+                "color_hit": o["color_hit"] if o else None, "result": result}
+
+    def data_stats(self) -> dict:
+        return self._memo("data_stats", self._data_stats)
+
+    def _data_stats(self) -> dict:
+        nums = self._numbers()
+        out = analysis.analyze(nums, self.repo.get_meta())
+        if out.get("counts"):
+            out["colour"] = colour_analysis(nums)
+            out["size"] = size_analysis(nums)
+        return out
+
+    def performance(self) -> dict:
+        return self._memo("performance", self._performance)
+
+    def _performance(self) -> dict:
+        outs = list(self._all_outcomes())
+        live = self.live_metrics()
+        keys = {"top1": "top1_hit", "top3": "top3_hit", "bs": "bs_hit", "color": "color_hit"}
+        series = {m: [] for m in METRICS}
+        for m in METRICS:
+            cum = np.cumsum([float(o["outcome"][keys[m]]) for o in outs]) if outs else np.array([])
+            step = max(1, len(cum) // 200)
+            series[m] = [{"n": i + 1, "rate": float(cum[i] / (i + 1))} for i in range(0, len(cum), step)]
+        bt = self.repo.latest_backtest()
+        windows = {m: {str(w): self._window(outs, keys[m], BASELINES[m], w) for w in ROLLING_WINDOWS} for m in METRICS}
+        return {"disclaimer": DISCLAIMER, "baselines": BASELINES, "signal": self.current_signal(),
+                "live": {"total_predictions": live["top1"]["n"], "metrics": live, "series": series, "windows": windows,
+                         "note": "Live = predictions made before the actual result arrived. Needs 100+ to mean anything."},
+                "backtest": None if not bt else {"id": bt["id"], **bt["summary"]}}
+
+    @staticmethod
+    def _window(outs: list, key: str, baseline: float, w: int) -> dict:
+        """Accuracy over the LAST `w` resolved live predictions (picks made before their round ended). Fewer than `w` exist -> uses what exists and says so."""
+        hits = [bool(o["outcome"][key]) for o in outs[-w:]]
+        st = rate_stats(hits, baseline)
+        return {"window": w, "n": st["n"], "correct": st["k"], "incorrect": st["n"] - st["k"], "rate": st["rate"], "lo": st["lo"], "hi": st["hi"],
+                "baseline": baseline, "full": st["n"] >= w}
+
+    def _confidence(self, shown: Optional[dict]) -> Optional[dict]:
+        """Confidence for the Big/Small pick that can be defended. The raw model probability is NOT used as confidence: it is an uncalibrated
+        score. A pick may only claim more than 50% when walk-forward validation proved an edge (signal moderate/strong); then the claim is the
+        LOWER bound of the measured hit rate, never the optimistic estimate. Otherwise it is 50% - a coin flip."""
+        sp = (shown or {}).get("size_probs") or {}
+        if sp.get("Big") is None:
+            return None
+        raw = max(sp["Big"], sp["Small"])
+        sig = (shown.get("signal") or {})
+        level = sig.get("level", "none")
+        v = (self._validation() or {}).get("metrics", {}).get("bs") if level in ("moderate", "strong") else None
+        cal = max(0.5, float(v["lo"])) if v and v.get("lo") is not None else 0.5
+        basis = ("lower bound of the walk-forward hit rate (validated edge)" if cal > 0.5 else
+                 "no validated edge: on unseen rounds this model is not distinguishable from a coin flip")
+        return {"pick": shown.get("size"), "raw_model_probability": round(float(raw), 4), "calibrated": round(cal, 4), "signal": level, "basis": basis}
+
+    def stats_report(self) -> dict:
+        out = self._memo("stats_report", self._stats_report)
+        out["backtest_state"] = self.backtest_state          # live progress must never come from the cache
+        return out
+
+    def _stats_report(self) -> dict:
+        nums = self._numbers()
+        rows, _ = self.repo.list_results(len(nums) or 1, 0)
+        return {"total_results": len(nums), "backtest_state": self.backtest_state, "disclaimer": DISCLAIMER,
+                "accuracy": accuracy_report(self.repo.latest_backtest(with_rows=True)), "hot_cold": hot_cold(nums),
+                "streaks": streaks(nums), "daily": daily_summary(rows[::-1])}
+
+    def backtest_results(self) -> dict:
+        bt = self.repo.latest_backtest(with_rows=True)
+        return {"state": self.backtest_state, "backtest": bt}
+
+    # ------------------------------------------------------------ backtest (re-evaluation on all stored data)
+    def run_backtest(self, use_ml: bool = True) -> dict:
+        with self.lock:
+            if self.backtest_state["status"] == "running":
+                raise ServiceError("a backtest is already running")
+            seq = self._numbers()
+            self.backtest_state = {"status": "running", "progress": 0, "total": max(0, len(seq) - self.min_history), "error": None}
+        try:
+            def prog(i, t): self.backtest_state.update(progress=i, total=t)
+            res = run_walk_forward(seq, start=self.min_history, refit_every=self.engine.refit_every, use_ml=use_ml, progress=prog)
+            self.repo.save_backtest(res["summary"], res["rows"])
+            self.backtest_state = {"status": "done", "progress": len(seq), "total": len(seq), "error": None}
+            with self.lock:                                   # refresh the signal on the pending prediction
+                last = self.repo.last_result()
+                if last:
+                    self.repo.expire_pending_except(-1)
+                    self._next_prediction()
+            return res["summary"]
+        except Exception as e:                                # noqa: BLE001 - reported through state
+            self.backtest_state = {"status": "error", "progress": 0, "total": 0, "error": str(e)}
+            raise
