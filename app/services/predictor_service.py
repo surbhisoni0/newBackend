@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Callable, Optional
 import numpy as np
+from app.backtesting import direct_reverse as dr
 from app.backtesting.walk_forward import run_walk_forward
 from app.database.base import Repository
 from app.prediction.engine import PredictionEngine
@@ -454,6 +455,68 @@ class PredictorService:
     def backtest_results(self) -> dict:
         bt = self.repo.latest_backtest(with_rows=True)
         return {"state": self.backtest_state, "backtest": bt}
+
+    # ------------------------------------------------------------ DIRECT vs REVERSE (additive: reads stored walk-forward rows + live outcomes)
+    def _dr_rows(self, source: str = "backtest") -> list:
+        """Verified predictions to analyse. 'backtest' = the stored walk-forward rows (every round predicted from earlier rounds only);
+        'live' = predictions this server stored BEFORE their round ended and later scored."""
+        if source == "live":
+            return [{"target_seq": o["target_seq"], "actual": o["outcome"]["actual"], "size": o["size"]} for o in self._all_outcomes()]
+        bt = self.repo.latest_backtest()
+        key = bt["id"] if bt else None
+        c = getattr(self, "_dr_cache", None)
+        if c and c[0] == key:
+            return c[1]
+        full = self.repo.latest_backtest(with_rows=True)
+        rows = full["rows"] if full else []
+        self._dr_cache = (key, rows)
+        return rows
+
+    def direct_reverse(self, source: str = "backtest", seq_from=None, seq_to=None, date_from=None, date_to=None, window: int = 100) -> dict:
+        rows = self._dr_rows(source)
+        if not rows:
+            return {"available": False, "source": source, "mode_rounds": len(self._numbers()),
+                    "reason": ("No walk-forward backtest has been run for this mode yet. Run POST /api/backtest/run first." if source == "backtest"
+                               else "No resolved live predictions yet.")}
+        meta = self.repo.get_meta()
+        by_seq = {m["seq"]: m.get("period_id") for m in meta}
+        recs = dr.select(dr.build_records(rows, by_seq), seq_from, seq_to, date_from, date_to)
+        out = dr.analyse(recs, window=max(10, min(int(window), 1000)), all_meta=meta)
+        out["source"] = source
+        out["has_algorithm_detail"] = any(r.get("size_by_model") for r in rows[:5])
+        if not out["has_algorithm_detail"]:
+            out["note"] = "This backtest was stored before per-algorithm picks were recorded; re-run POST /api/backtest/run for the algorithm-wise table."
+        return out
+
+    def strategy_prediction(self, strategy: str = "direct") -> dict:
+        """The experimental mode switch. 'direct' = the app's pick. 'reverse' = its opposite. 'best' = whichever of the two the PAST data justifies
+        (rule in direct_reverse.adaptive_choices) using only rounds resolved before this one. The existing /prediction/next is untouched."""
+        if strategy not in dr.STRATEGIES:
+            raise ServiceError(f"strategy must be one of {list(dr.STRATEGIES)}")
+        base = self.next_prediction()
+        if not base.get("available"):
+            return {**base, "strategy": strategy}
+        orig = base["size"]
+        past = self._past_hits(base["target_seq"])
+        if strategy == "best":
+            ch = dr.next_choice(past)
+            used = ch["strategy"]
+        else:
+            ch, used = None, strategy
+        final = dr.flip(orig) if used == "reverse" else orig
+        return {"available": True, "strategy": strategy, "strategy_used": used, "original_pick": orig, "final_pick": final,
+                "target_period": base.get("target_period"), "target_seq": base["target_seq"], "kind": base.get("kind"),
+                "selection": ch, "history_used": len(past),
+                "warning": "Experimental. Walk-forward evidence shows no reliable edge for either direction; expect ~50%.",
+                "base": {k: base.get(k) for k in ("timing", "confidence", "signal", "size_probs")}}
+
+    def _past_hits(self, before_seq: int) -> list:
+        """Direct hit flags for every round resolved BEFORE `before_seq`: stored walk-forward rows, then live outcomes after them. No look-ahead."""
+        rows = {r["target_seq"]: (r["size"] == ("Big" if r["actual"] >= 5 else "Small")) for r in self._dr_rows("backtest") if r["target_seq"] < before_seq}
+        for o in self._all_outcomes():
+            if o["target_seq"] < before_seq and o["target_seq"] not in rows:
+                rows[o["target_seq"]] = bool(o["outcome"]["bs_hit"])
+        return [rows[k] for k in sorted(rows)]
 
     # ------------------------------------------------------------ backtest (re-evaluation on all stored data)
     def run_backtest(self, use_ml: bool = True) -> dict:
