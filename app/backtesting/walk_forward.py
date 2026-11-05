@@ -49,7 +49,10 @@ def run_walk_forward(seq, start: int = 100, refit_every: int = 10, use_ml: bool 
             hits["Consensus"][m].append(bool(h))
         rows.append({"target_seq": t + 1, "actual": actual, "top1": d["top1"], "top3": d["top3"], "size": d["size"],
                      "color": d["color"], "top1_hit": bool(ch[0]), "top3_hit": bool(ch[1]),
-                     "bs_hit": bool(ch[2]), "color_hit": bool(ch[3])})
+                     "bs_hit": bool(ch[2]), "color_hit": bool(ch[3]),
+                     # additive fields used by the Direct-vs-Reverse analysis (existing keys above are unchanged)
+                     "p_big": round(float(sp[1]), 6),
+                     "size_by_model": {k: ("Big" if p[5:].sum() > p[:5].sum() else "Small") for k, p in scores.items()}})
         if progress and (t - start) % 25 == 0:
             progress(t - start, n_total - start)
     summary = summarize(hits, logloss, n_total, start, refit_every)
