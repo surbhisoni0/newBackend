@@ -175,3 +175,18 @@ def backtest_run(request: Request, background: BackgroundTasks):
 @router.get("/model-performance")
 def model_performance(request: Request):
     return svc(request).performance()
+
+
+@router.get("/direct-reverse")
+def direct_reverse(request: Request, source: str = Query("backtest", pattern="^(backtest|live)$"),
+                   seq_from: Optional[int] = Query(None, ge=1), seq_to: Optional[int] = Query(None, ge=1),
+                   date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"), date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                   window: int = Query(100, ge=10, le=1000)):
+    """DIRECT vs REVERSE analysis on exactly the same verified walk-forward predictions (date range = date inside the period id)."""
+    return svc(request).direct_reverse(source, seq_from, seq_to, date_from, date_to, window)
+
+
+@router.get("/prediction/strategy")
+def prediction_strategy(request: Request, strategy: str = Query("direct", pattern="^(direct|reverse|best)$")):
+    """Experimental modes: direct | reverse | best (historically validated, no look-ahead). /prediction/next is unchanged."""
+    return svc(request).strategy_prediction(strategy)
