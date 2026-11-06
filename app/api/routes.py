@@ -190,3 +190,18 @@ def direct_reverse(request: Request, source: str = Query("backtest", pattern="^(
 def prediction_strategy(request: Request, strategy: str = Query("direct", pattern="^(direct|reverse|best)$")):
     """Experimental modes: direct | reverse | best (historically validated, no look-ahead). /prediction/next is unchanged."""
     return svc(request).strategy_prediction(strategy)
+
+
+@router.get("/research/report")
+def research_report():
+    """Read-only: the stored result of `python -m app.backtesting.research` (strict DEV/FINAL walk-forward model comparison).
+    Additive endpoint; nothing else depends on it. Returns {"available": false} until the report file exists."""
+    import json
+    from pathlib import Path
+    f = Path(__file__).resolve().parents[2] / "data" / "research_report.json"
+    if not f.exists():
+        return {"available": False, "note": "run: python -m app.backtesting.research --out data/research_report.json"}
+    try:
+        return {"available": True, **json.loads(f.read_text(encoding="utf-8"))}
+    except (OSError, ValueError):
+        raise HTTPException(status_code=500, detail="research report is unreadable")
