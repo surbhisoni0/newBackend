@@ -63,7 +63,7 @@ class Windows(unittest.TestCase):
 
     def test_no_prediction_when_no_validated_edge(self):
         c = self.svc.next_prediction()["confidence"]
-        self.assertTrue(c["abstain"]); self.assertEqual(c["recommendation"], "NO PREDICTION")
+        self.assertTrue(c["abstain"]); self.assertEqual(c["recommendation"], "NO PREDICTION"); self.assertEqual(c["level"], "LOW")
 
     def test_confidence_is_a_coin_flip_without_validated_edge(self):
         p = self.svc.next_prediction()
@@ -79,6 +79,7 @@ class Windows(unittest.TestCase):
         self.svc._validation = lambda: {"metrics": {"bs": {"lo": 0.53, "rate": 0.6}}}
         try:
             c = self.svc._confidence(shown)
+            self.assertEqual(c["level"], "MEDIUM")
             self.assertEqual(c["calibrated"], 0.53)                  # lower bound, not the 90% raw score and not the 60% point estimate
             shown["signal"] = {"level": "weak"}
             self.assertEqual(self.svc._confidence(shown)["calibrated"], 0.5)
